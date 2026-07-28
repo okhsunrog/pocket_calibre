@@ -55,18 +55,6 @@ impl Field {
         })
     }
 
-    fn title(self) -> &'static str {
-        match self {
-            Self::Server => "Адрес сервера",
-            Self::User => "Логин",
-            Self::Password => "Пароль",
-            Self::Library => "Библиотека",
-            Self::DownloadDir => "Папка загрузки",
-            Self::Formats => "Форматы",
-            Self::Limit => "Сколько книг показывать",
-        }
-    }
-
     fn flags(self) -> c_int {
         let flags = match self {
             Self::Server => KBD_URL,
@@ -84,6 +72,10 @@ pub type Answer = (Field, Option<String>);
 
 struct Request {
     field: Field,
+    /// Заголовок диалога. Приходит из Slint уже переведённым — это подпись
+    /// той самой строки настроек, по которой тапнули, второго списка этих
+    /// строк на стороне Rust нет.
+    title: String,
     initial: String,
 }
 
@@ -109,7 +101,7 @@ pub fn init(iv: &'static Inkview, answers: Sender<Answer>) {
 
 /// Просит открыть клавиатуру. Вызывается с UI-потока и возвращается сразу:
 /// ответ придёт в канал, переданный в [`init`].
-pub fn request(field: Field, initial: String) {
+pub fn request(field: Field, title: String, initial: String) {
     let Some(iv) = IV.get() else { return };
 
     // Вторая заявка, пока не отработала первая, затирала бы её: trampoline
@@ -120,7 +112,7 @@ pub fn request(field: Field, initial: String) {
     if pending.is_some() || is_open(iv) {
         return;
     }
-    *pending = Some(Request { field, initial });
+    *pending = Some(Request { field, title, initial });
     drop(pending);
 
     unsafe {
@@ -145,7 +137,7 @@ unsafe extern "C" fn trampoline(_context: *mut c_void) {
         return;
     };
 
-    let Ok(title) = CString::new(request.field.title()) else {
+    let Ok(title) = CString::new(request.title) else {
         return;
     };
 

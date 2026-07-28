@@ -1,5 +1,19 @@
 use inkview::bindings::{Inkview, NET_CONNECTED};
 
+/// Connecting to the network failed; carries the `NetConnect` result code.
+/// A typed error rather than a message: the UI thread renders it in the
+/// current language (see [`crate::i18n::Status::NetworkFailed`]).
+#[derive(Debug, Clone, Copy)]
+pub struct ConnectError(pub i32);
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "couldn't connect to the network (code {})", self.0)
+    }
+}
+
+impl std::error::Error for ConnectError {}
+
 /// Поднимает Wi-Fi, если он выключен.
 ///
 /// `QueryNetwork` возвращает битовую маску состояния. `NET_CONNECTED` — это не
@@ -10,7 +24,7 @@ use inkview::bindings::{Inkview, NET_CONNECTED};
 ///
 /// `NetConnect(NULL)` подключается к последней использованной сети и сам
 /// показывает системный диалог, если нужна ручная настройка.
-pub fn ensure_online(iv: &Inkview) -> Result<(), String> {
+pub fn ensure_online(iv: &Inkview) -> Result<(), ConnectError> {
     unsafe {
         if iv.QueryNetwork() & NET_CONNECTED as i32 != 0 {
             return Ok(());
@@ -20,7 +34,7 @@ pub fn ensure_online(iv: &Inkview) -> Result<(), String> {
         if result == 0 {
             Ok(())
         } else {
-            Err(format!("не удалось подключиться к сети (код {result})"))
+            Err(ConnectError(result))
         }
     }
 }

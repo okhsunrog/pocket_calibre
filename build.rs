@@ -19,6 +19,15 @@ const FONT_CANDIDATES: &[(&str, &str)] = &[
         "/usr/share/fonts/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
     ),
+    // Debian/Ubuntu keep the same families under truetype/.
+    (
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ),
+    (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ),
 ];
 
 fn main() {
@@ -74,9 +83,18 @@ fn main() {
     // вычисляются из мм и dpi, а не заданы литералами в px. Растровое
     // встраивание берёт лишь литеральные размеры и весь текст рисовался бы
     // одним 12px-атласом; SDF рендерит любой размер из одного представления.
+    // Translations are compiled into the binary: the device has no gettext
+    // (glibc 2.23), so runtime .mo loading is not an option. English is the
+    // @tr() source language and needs no catalog; Russian comes from
+    // lang/ru/LC_MESSAGES/pocket_calibre.po. The default gettext context (the
+    // enclosing component name) is disabled: with it, entries would need
+    // `msgctxt "MainWindow"` and renaming the component would silently drop
+    // every translation.
     let config = slint_build::CompilerConfiguration::new()
         .embed_resources(slint_build::EmbedResourcesKind::EmbedForSoftwareRenderer)
-        .with_sdf_fonts(true);
+        .with_sdf_fonts(true)
+        .with_bundled_translations("lang")
+        .with_default_translation_context(slint_build::DefaultTranslationContext::None);
 
     slint_build::compile_with_config("ui/app.slint", config).unwrap();
 }

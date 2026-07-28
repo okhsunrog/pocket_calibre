@@ -45,7 +45,10 @@ component FlatButton inherits Rectangle {
 component SettingRow inherits Rectangle {
     in property <string> label;
     in property <string> value;
-    callback clicked();
+    // Передаёт наружу собственную (уже переведённую) подпись: Rust использует
+    // её как заголовок нативной клавиатуры, чтобы не держать второй список
+    // тех же строк на своей стороне.
+    callback clicked(string);
 
     background: touch.pressed ? #cccccc : #ffffff;
 
@@ -77,7 +80,7 @@ component SettingRow inherits Rectangle {
 
     touch := TouchArea {
         clicked => {
-            root.clicked();
+            root.clicked(root.label);
         }
     }
 }
@@ -100,6 +103,7 @@ export component MainWindow inherits Window {
     in property <string> cfg-download-dir;
     in property <string> cfg-formats;
     in property <string> cfg-limit;
+    in property <string> cfg-language;
 
     // Меняется, когда кадр нужно перерисовать целиком: после нативной
     // клавиатуры, которая рисует поверх нашего кадра, и после возврата из
@@ -111,13 +115,19 @@ export component MainWindow inherits Window {
     callback refresh();
     callback download(int);
     callback toggle-settings();
-    callback edit-field(int);
+    // Второй аргумент — подпись строки настроек: она же заголовок клавиатуры.
+    callback edit-field(int, string);
+    // Язык не набирают на клавиатуре, а перебирают тапом: Авто → English →
+    // Русский. Отдельный колбэк, чтобы не пропускать его через edit-field.
+    callback cycle-language();
     callback prev-page();
     callback next-page();
 
     // Компилятор встраивает глифы только для латиницы, цифр и строковых
-    // литералов, найденных в этом файле. Названия книг приходят из Rust, так
-    // что нужный алфавит перечисляем здесь явно — иначе на экране будут дыры.
+    // литералов, найденных в этом файле. Кириллица нужна независимо от языка
+    // интерфейса: названия книг приходят с сервера, а русские статусы и
+    // строки из lang/ru рендерит Rust. Поэтому алфавит перечислен здесь явно —
+    // иначе на экране будут дыры.
     // Свойство публичное намеренно: у экспортируемого компонента такие
     // свойства не вычищаются оптимизатором.
     in property <string> glyph-set: "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюяІіЇїЄєҐґЎў«»„“”—–…•№±§°←→ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõöøùúûüýþÿĀāĆćČčĐđĘęĞğŁłŃńŇňŐőŒœŘřŚśŞşŠšŤťŰűŸŹźŻżŽž";
@@ -184,7 +194,7 @@ export component MainWindow inherits Window {
                     height: 10 * Metrics.mm;
                     min-width: 20 * Metrics.mm;
                     text-size: 3 * Metrics.mm;
-                    label: root.busy ? "Подождите…" : "Обновить";
+                    label: root.busy ? @tr("Wait…") : @tr("Refresh");
                     enabled: !root.busy && !root.settings-open;
                     clicked => {
                         root.refresh();
@@ -195,7 +205,7 @@ export component MainWindow inherits Window {
                     height: 10 * Metrics.mm;
                     min-width: 20 * Metrics.mm;
                     text-size: 3 * Metrics.mm;
-                    label: root.settings-open ? "Готово" : "Настройки";
+                    label: root.settings-open ? @tr("Done") : @tr("Settings");
                     clicked => {
                         root.toggle-settings();
                     }
@@ -218,64 +228,73 @@ export component MainWindow inherits Window {
 
                     SettingRow {
                         height: root.row-height;
-                        label: "Адрес сервера";
+                        label: @tr("Server address");
                         value: root.cfg-server;
-                        clicked => {
-                            root.edit-field(0);
+                        clicked(label) => {
+                            root.edit-field(0, label);
                         }
                     }
 
                     SettingRow {
                         height: root.row-height;
-                        label: "Логин";
+                        label: @tr("Login");
                         value: root.cfg-user;
-                        clicked => {
-                            root.edit-field(1);
+                        clicked(label) => {
+                            root.edit-field(1, label);
                         }
                     }
 
                     SettingRow {
                         height: root.row-height;
-                        label: "Пароль";
+                        label: @tr("Password");
                         value: root.cfg-password;
-                        clicked => {
-                            root.edit-field(2);
+                        clicked(label) => {
+                            root.edit-field(2, label);
                         }
                     }
 
                     SettingRow {
                         height: root.row-height;
-                        label: "Библиотека";
+                        label: @tr("Library");
                         value: root.cfg-library;
-                        clicked => {
-                            root.edit-field(3);
+                        clicked(label) => {
+                            root.edit-field(3, label);
                         }
                     }
 
                     SettingRow {
                         height: root.row-height;
-                        label: "Папка загрузки";
+                        label: @tr("Download folder");
                         value: root.cfg-download-dir;
-                        clicked => {
-                            root.edit-field(4);
+                        clicked(label) => {
+                            root.edit-field(4, label);
                         }
                     }
 
                     SettingRow {
                         height: root.row-height;
-                        label: "Форматы";
+                        label: @tr("Formats");
                         value: root.cfg-formats;
-                        clicked => {
-                            root.edit-field(5);
+                        clicked(label) => {
+                            root.edit-field(5, label);
                         }
                     }
 
                     SettingRow {
                         height: root.row-height;
-                        label: "Сколько книг показывать";
+                        label: @tr("Books to show");
                         value: root.cfg-limit;
+                        clicked(label) => {
+                            root.edit-field(6, label);
+                        }
+                    }
+
+                    SettingRow {
+                        height: root.row-height;
+                        label: @tr("Language");
+                        value: root.cfg-language;
                         clicked => {
-                            root.edit-field(6);
+                            root.cycle-language();
                         }
                     }
                 }

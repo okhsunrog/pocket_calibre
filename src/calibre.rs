@@ -90,7 +90,7 @@ impl Client {
         let ids: Vec<i64> = search
             .get("book_ids")
             .and_then(Value::as_array)
-            .ok_or("в ответе /ajax/search нет book_ids")?
+            .ok_or("no book_ids in the /ajax/search response")?
             .iter()
             .filter_map(Value::as_i64)
             .collect();
@@ -130,7 +130,7 @@ impl Client {
         };
 
         let map: Value = self.get(&url)?.body_mut().read_json()?;
-        let map = map.as_object().ok_or("в ответе /ajax/books не объект")?;
+        let map = map.as_object().ok_or("the /ajax/books response is not an object")?;
 
         let mut books = Vec::with_capacity(map.len());
         for (key, meta) in map {
@@ -139,10 +139,13 @@ impl Client {
             }
             let Ok(id) = key.parse::<i64>() else { continue };
 
+            // Missing title/author stay empty here: the list substitutes a
+            // localized placeholder at display time (see `Pager::render`),
+            // while `download` uses fixed English constants for filenames.
             let title = meta
                 .get("title")
                 .and_then(Value::as_str)
-                .unwrap_or("Без названия")
+                .unwrap_or_default()
                 .to_string();
 
             let author = meta
@@ -154,8 +157,7 @@ impl Client {
                         .collect::<Vec<_>>()
                         .join(", ")
                 })
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "Неизвестный автор".to_string());
+                .unwrap_or_default();
 
             let available: Vec<String> = meta
                 .get("formats")
@@ -192,7 +194,7 @@ impl Client {
         let library = self
             .library
             .as_ref()
-            .ok_or("неизвестен id библиотеки, обновите список")?;
+            .ok_or("library id unknown, refresh the list")?;
 
         let url = format!(
             "{}/get/thumb/{}/{}?sz={}x{}",
@@ -212,15 +214,19 @@ impl Client {
         let format = book
             .format
             .as_ref()
-            .ok_or("нет подходящего формата для этой книги")?;
+            .ok_or("no suitable format for this book")?;
         let library = self
             .library
             .as_ref()
-            .ok_or("неизвестен id библиотеки, обновите список")?;
+            .ok_or("library id unknown, refresh the list")?;
 
         ensure_dir(dir)?;
 
-        let name = sanitize_filename(&format!("{} - {}", book.author, book.title));
+        // Filenames use fixed English fallbacks, not the localized ones: what
+        // lands on disk must not depend on the UI language of the moment.
+        let author = if book.author.is_empty() { "Unknown author" } else { &book.author };
+        let title = if book.title.is_empty() { "Untitled" } else { &book.title };
+        let name = sanitize_filename(&format!("{author} - {title}"));
         let target = dir.join(format!("{name}.{}", format.to_lowercase()));
         if target.exists() {
             return Ok(target);

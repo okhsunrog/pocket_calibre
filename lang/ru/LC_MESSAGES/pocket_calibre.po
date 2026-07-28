@@ -1,0 +1,51 @@
+# Russian translation of the Slint UI strings.
+#
+# msgids must stay byte-identical to the @tr() literals in ui/app.slint:
+# a mismatch is not an error, the string just silently falls back to the
+# English source text. Do not add msgctxt either — build.rs disables the
+# default per-component context (DefaultTranslationContext::None), so a
+# context here would be another silent mismatch. Rust-side strings are
+# translated in src/i18n.rs, not here.
+msgid ""
+msgstr ""
+"Project-Id-Version: pocket_calibre\n"
+"Language: ru\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+msgid "Refresh"
+msgstr "Обновить"
+
+msgid "Wait…"
+msgstr "Подождите…"
+
+msgid "Settings"
+msgstr "Настройки"
+
+msgid "Done"
+msgstr "Готово"
+
+msgid "Server address"
+msgstr "Адрес сервера"
+
+msgid "Login"
+msgstr "Логин"
+
+msgid "Password"
+msgstr "Пароль"
+
+msgid "Library"
+msgstr "Библиотека"
+
+msgid "Download folder"
+msgstr "Папка загрузки"
+
+msgid "Formats"
+msgstr "Форматы"
+
+msgid "Books to show"
+msgstr "Сколько книг показывать"
+
+msgid "Language"
+msgstr "Язык"
