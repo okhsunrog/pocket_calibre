@@ -21,6 +21,10 @@ pub struct Config {
     pub download_dir: PathBuf,
     pub formats: Vec<String>,
     pub limit: usize,
+    /// UI language: absent = follow the firmware ("auto"), or "en"/"ru".
+    /// Parsed leniently by [`crate::i18n::LangChoice::from_config`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
 }
 
 impl Default for Config {
@@ -33,29 +37,41 @@ impl Default for Config {
             download_dir: PathBuf::from("/mnt/ext1/Books"),
             formats: vec!["FB2".into(), "EPUB".into(), "PDF".into(), "MOBI".into()],
             limit: 200,
+            language: None,
         }
     }
 }
 
-/// Шапка приписывается при каждом сохранении: `toml` комментарии не
-/// сохраняет, а файл должен оставаться понятным тому, кто открыл его руками.
+/// The header is prepended on every save: `toml` does not keep comments,
+/// and the file must stay readable for whoever opens it by hand.
 const HEADER: &str = "\
-# pocket_calibre — настройки. Файл перезаписывается экраном настроек.
-# server        — адрес calibre content server
-# user/password — если сервер требует авторизацию (только basic)
-# library       — id библиотеки; без него берётся библиотека по умолчанию
-# formats       — по убыванию предпочтения, качается первый доступный
+# pocket_calibre settings. Rewritten by the in-app settings screen.
+# server        — calibre content server address
+# user/password — if the server requires auth (basic only)
+# library       — library id; the server default is used when absent
+# formats       — in order of preference, the first available one is downloaded
+# language      — ui language: omit the key for auto, or set en / ru
 
 ";
+
+/// What went wrong (or notably right) while loading the config. Kept as data
+/// rather than a message so the UI thread can render it in the current
+/// language — this module stays UI-agnostic.
+#[derive(Debug)]
+pub enum LoadNote {
+    ParseError { path: PathBuf, error: String },
+    Created,
+    CreateFailed { path: PathBuf, error: String },
+}
 
 impl Config {
     /// Ищет конфиг рядом с исполняемым файлом, затем в стандартных папках
     /// PocketBook. Если ничего нет — создаёт файл с настройками по умолчанию
     /// и возвращает их вместе с путём.
     ///
-    /// Третий элемент — сообщение для строки состояния, если что-то пошло
+    /// Третий элемент — заметка для строки состояния, если что-то пошло
     /// не так или конфига не было вовсе.
-    pub fn load() -> (Self, PathBuf, Option<String>) {
+    pub fn load() -> (Self, PathBuf, Option<LoadNote>) {
         let candidates = Self::candidate_paths();
 
         for path in &candidates {
@@ -70,7 +86,10 @@ impl Config {
                 Err(e) => (
                     Self::default(),
                     path.clone(),
-                    Some(format!("Ошибка в {}: {e}", path.display())),
+                    Some(LoadNote::ParseError {
+                        path: path.clone(),
+                        error: e.to_string(),
+                    }),
                 ),
             };
         }
@@ -82,8 +101,11 @@ impl Config {
 
         let defaults = Self::default();
         let note = match defaults.save(&target) {
-            Ok(()) => "Настройки не найдены — укажите адрес сервера".to_string(),
-            Err(e) => format!("Не удалось создать {}: {e}", target.display()),
+            Ok(()) => LoadNote::Created,
+            Err(e) => LoadNote::CreateFailed {
+                path: target.clone(),
+                error: e.to_string(),
+            },
         };
 
         (defaults, target, Some(note))
@@ -167,6 +189,7 @@ mod tests {
             // Кавычки и пробелы — то, на чём ломался прежний key=value формат.
             password: Some("па \"роль\" с = и #".to_string()),
             download_dir: PathBuf::from("/mnt/ext1/Мои книги"),
+            language: Some("ru".to_string()),
             ..Default::default()
         };
 
@@ -179,6 +202,7 @@ mod tests {
         assert_eq!(parsed.download_dir, cfg.download_dir);
         assert_eq!(parsed.formats, cfg.formats);
         assert_eq!(parsed.limit, cfg.limit);
+        assert_eq!(parsed.language, cfg.language);
     }
 
     #[test]
@@ -204,5 +228,7 @@ mod tests {
         assert_eq!(parsed.user, None);
         assert_eq!(parsed.limit, Config::default().limit);
         assert_eq!(parsed.formats, Config::default().formats);
+        // Configs written before the language setting existed load as auto.
+        assert_eq!(parsed.language, None);
     }
 }

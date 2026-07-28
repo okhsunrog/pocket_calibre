@@ -1,5 +1,6 @@
 mod calibre;
 mod config;
+mod i18n;
 mod keyboard;
 mod libm_shim;
 mod net;
@@ -13,11 +14,13 @@ use std::time::Duration;
 
 use inkview::Event;
 use inkview::bindings::Inkview;
+use inkview::event::Key;
 use inkview::screen::Screen;
 use slint::{ComponentHandle, Image, ModelRc, Rgb8Pixel, SharedPixelBuffer, TimerMode, VecModel};
 
 use calibre::{Book, Client};
-use config::Config;
+use config::{Config, LoadNote};
+use i18n::{Lang, LangChoice, Status};
 use keyboard::Field;
 
 slint::include_modules!();
@@ -48,12 +51,14 @@ enum Cmd {
     Covers(Vec<i64>),
 }
 
-/// Ответы рабочего потока к UI.
+/// Ответы рабочего потока к UI. Тексты здесь не ходят: статусы и состояния
+/// книг передаются данными, а во фразы на текущем языке их превращает
+/// UI-поток (см. `i18n`) — иначе смена языка не перерисовала бы их.
 enum Msg {
-    Status(String),
+    Status(Status),
     Busy(bool),
     Books(Vec<Book>),
-    BookState(i32, &'static str),
+    BookState(i32, i18n::BookState),
     Cover { id: i64, cover: CachedCover },
 }
 
@@ -153,11 +158,12 @@ fn main() {
     let iv: &'static Inkview = Box::leak(Box::new(inkview::load()));
     let (evt_tx, evt_rx) = mpsc::channel();
     let (redraw_tx, redraw_rx) = mpsc::channel();
+    let (lang_tx, lang_rx) = mpsc::channel();
 
     std::thread::Builder::new()
         .name("ui".to_string())
         .stack_size(8 * 1024 * 1024)
-        .spawn(move || ui_main(iv, evt_rx, redraw_rx))
+        .spawn(move || ui_main(iv, evt_rx, redraw_rx, lang_rx))
         .expect("не удалось запустить UI-поток");
 
     inkview::iv_main(iv, move |event| {
@@ -171,6 +177,21 @@ fn main() {
                 iv.CloseApp();
             }
             return Some(());
+        }
+
+        // Язык прошивки читается только здесь, на потоке inkview, — как и все
+        // прочие вызовы с ним связанные (см. `keyboard`). При старте значение
+        // уходит в канал раньше EVT_INIT, так что к моменту, когда UI-поток
+        // начнёт строить окно, язык уже известен. Смена языка в системных
+        // настройках приходит клавишей LanguageChange — перечитываем и просим
+        // полную перерисовку: прошивка рисовала поверх нас свои меню.
+        if matches!(event, Event::Init)
+            || matches!(event, Event::KeyDown { key: Key::LanguageChange })
+        {
+            let _ = lang_tx.send(i18n::system_lang(iv));
+        }
+        if matches!(event, Event::KeyDown { key: Key::LanguageChange }) {
+            let _ = redraw_tx.send(());
         }
 
         // Пока открыта нативная клавиатура, ввод принадлежит ей: пробрасывать
@@ -228,7 +249,11 @@ struct Pager {
     /// снова просила бы все ещё не пришедшие: на страницу из N книг выходило
     /// порядка N²/2 запросов к серверу.
     requested: RefCell<HashSet<i64>>,
-    states: RefCell<HashMap<i64, &'static str>>,
+    states: RefCell<HashMap<i64, i18n::BookState>>,
+    /// Текущий язык интерфейса — общая ячейка с `ui_main`. Нужен прямо в
+    /// `render()`: состояния книг, подписи-заглушки и номер страницы
+    /// переводятся при каждой отрисовке.
+    lang: Rc<Cell<Lang>>,
     page: Cell<usize>,
     rows: Cell<usize>,
     /// Модель изменилась, но перерисовку отложили до конца разбора очереди
@@ -241,6 +266,7 @@ impl Pager {
         window: slint::Weak<MainWindow>,
         model: Rc<VecModel<BookItem>>,
         cmd_tx: Sender<Cmd>,
+        lang: Rc<Cell<Lang>>,
     ) -> Self {
         Self {
             window,
@@ -251,6 +277,7 @@ impl Pager {
             cover_order: RefCell::new(VecDeque::new()),
             requested: RefCell::new(HashSet::new()),
             states: RefCell::new(HashMap::new()),
+            lang,
             page: Cell::new(0),
             rows: Cell::new(1),
             dirty: Cell::new(false),
@@ -289,7 +316,7 @@ impl Pager {
         }
     }
 
-    fn set_state(&self, id: i64, state: &'static str) {
+    fn set_state(&self, id: i64, state: i18n::BookState) {
         self.states.borrow_mut().insert(id, state);
         self.dirty.set(true);
     }
@@ -373,16 +400,32 @@ impl Pager {
 
         let covers = self.covers.borrow();
         let states = self.states.borrow();
+        let lang = self.lang.get();
 
         self.model.set_vec(
             visible
                 .iter()
                 .map(|book| BookItem {
                     id: book.id as i32,
-                    title: book.title.clone().into(),
-                    author: book.author.clone().into(),
+                    // Сервер мог не прислать название или автора — тогда поле
+                    // пустое (см. `calibre::Client::metadata`), и заглушку на
+                    // текущем языке подставляем здесь, при показе.
+                    title: if book.title.is_empty() {
+                        i18n::untitled(lang).into()
+                    } else {
+                        book.title.clone().into()
+                    },
+                    author: if book.author.is_empty() {
+                        i18n::unknown_author(lang).into()
+                    } else {
+                        book.author.clone().into()
+                    },
                     format: book.format.clone().unwrap_or_else(|| "—".to_string()).into(),
-                    state: states.get(&book.id).copied().unwrap_or_default().into(),
+                    state: states
+                        .get(&book.id)
+                        .map(|s| i18n::book_state(*s, lang))
+                        .unwrap_or_default()
+                        .into(),
                     cover: covers.get(&book.id).map(CachedCover::to_image).unwrap_or_default(),
                 })
                 .collect::<Vec<_>>(),
@@ -391,7 +434,7 @@ impl Pager {
         window.set_page_label(if all.is_empty() {
             Default::default()
         } else {
-            format!("стр. {} / {}", page + 1, total).into()
+            i18n::page_label(page + 1, total, lang).into()
         });
         window.set_has_prev(page > 0);
         window.set_has_next(page + 1 < total);
@@ -413,7 +456,12 @@ impl Pager {
     }
 }
 
-fn ui_main(iv: &'static Inkview, evt_rx: Receiver<Event>, redraw_rx: Receiver<()>) {
+fn ui_main(
+    iv: &'static Inkview,
+    evt_rx: Receiver<Event>,
+    redraw_rx: Receiver<()>,
+    lang_rx: Receiver<Lang>,
+) {
     // До EVT_INIT трогать экран нельзя.
     loop {
         match evt_rx.recv() {
@@ -432,8 +480,22 @@ fn ui_main(iv: &'static Inkview, evt_rx: Receiver<Event>, redraw_rx: Receiver<()
     let backend = inkview_slint::Backend::new(screen, evt_rx);
     slint::platform::set_platform(Box::new(backend)).expect("платформа уже установлена");
 
+    // Язык прошивки поток inkview кладёт в канал до EVT_INIT, так что здесь
+    // он уже дожидается. Дальше эти две ячейки живут на UI-потоке: системный
+    // язык и действующий (с учётом настройки в конфиге).
+    let sys_lang = Rc::new(Cell::new(lang_rx.try_recv().unwrap_or_default()));
+
     let (loaded, cfg_path, note) = Config::load();
+    let choice = LangChoice::from_config(loaded.language.as_deref());
+    let lang = Rc::new(Cell::new(choice.resolve(sys_lang.get())));
+
     let window = MainWindow::new().expect("не удалось создать окно");
+
+    // Только после создания первого компонента: до него у Slint ещё нет
+    // глобального контекста, в котором живёт выбор перевода.
+    if let Err(e) = slint::select_bundled_translation(lang.get().code()) {
+        eprintln!("select_bundled_translation({}): {e}", lang.get().code());
+    }
 
     // Настройки живут на UI-потоке: их показывает экран настроек, правит
     // клавиатура и сохраняет в файл. Рабочий поток получает копию.
@@ -451,13 +513,33 @@ fn ui_main(iv: &'static Inkview, evt_rx: Receiver<Event>, redraw_rx: Receiver<()
 
     let books = Rc::new(VecModel::<BookItem>::default());
     window.set_books(ModelRc::from(books.clone()));
-    window.set_status(
-        note.unwrap_or_else(|| format!("Конфиг: {}", cfg_path.display()))
-            .into(),
-    );
-    show_config(&window, &cfg.borrow());
 
-    let pager = Rc::new(Pager::new(window.as_weak(), books, cmd_tx.clone()));
+    // Последний статус храним данными, а не строкой: при смене языка его
+    // нужно перерисовать заново — см. `apply_language`.
+    let last_status: Rc<RefCell<Option<Status>>> = Rc::new(RefCell::new(None));
+
+    let initial = match note {
+        Some(LoadNote::ParseError { path, error }) => Status::ConfigError {
+            path: path.display().to_string(),
+            error,
+        },
+        Some(LoadNote::Created) => Status::ConfigMissing,
+        Some(LoadNote::CreateFailed { path, error }) => Status::ConfigCreateFailed {
+            path: path.display().to_string(),
+            error,
+        },
+        None => Status::ConfigPath(cfg_path.display().to_string()),
+    };
+    set_status(&window, &last_status, lang.get(), initial);
+    show_config(&window, &cfg.borrow());
+    window.set_cfg_language(i18n::language_row_value(choice, sys_lang.get()).into());
+
+    let pager = Rc::new(Pager::new(
+        window.as_weak(),
+        books,
+        cmd_tx.clone(),
+        lang.clone(),
+    ));
 
     std::thread::Builder::new()
         .name("worker".to_string())
@@ -500,7 +582,7 @@ fn ui_main(iv: &'static Inkview, evt_rx: Receiver<Event>, redraw_rx: Receiver<()
 
     window.on_edit_field({
         let cfg = cfg.clone();
-        move |index| {
+        move |index, title| {
             let Some(field) = Field::from_index(index) else {
                 return;
             };
@@ -510,7 +592,44 @@ fn ui_main(iv: &'static Inkview, evt_rx: Receiver<Event>, redraw_rx: Receiver<()
                 Field::Password => String::new(),
                 other => current_value(&cfg.borrow(), other),
             };
-            keyboard::request(field, initial);
+            // Заголовок клавиатуры — подпись строки настроек, уже на текущем
+            // языке: Slint передал её из @tr-литерала.
+            keyboard::request(field, title.into(), initial);
+        }
+    });
+
+    window.on_cycle_language({
+        let cfg = cfg.clone();
+        let cfg_path = cfg_path.clone();
+        let weak = window.as_weak();
+        let pager = pager.clone();
+        let last_status = last_status.clone();
+        let lang = lang.clone();
+        let sys_lang = sys_lang.clone();
+        move || {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+
+            let choice = {
+                let mut cfg = cfg.borrow_mut();
+                let next = LangChoice::from_config(cfg.language.as_deref()).next();
+                cfg.language = next.to_config();
+                next
+            };
+
+            // Смена языка нарочно НЕ шлёт Cmd::Reconfigure: клиенту calibre
+            // язык безразличен, а Reconfigure сбросил бы список книг.
+            if let Err(e) = cfg.borrow().save(&cfg_path) {
+                set_status(
+                    &window,
+                    &last_status,
+                    lang.get(),
+                    Status::SettingsSaveFailed(e.to_string()),
+                );
+            }
+
+            apply_language(&window, &pager, &last_status, &lang, choice, sys_lang.get());
         }
     });
 
@@ -525,11 +644,23 @@ fn ui_main(iv: &'static Inkview, evt_rx: Receiver<Event>, redraw_rx: Receiver<()
         let cfg = cfg.clone();
         let cmd_tx = cmd_tx.clone();
         let cfg_path = cfg_path.clone();
+        let last_status = last_status.clone();
+        let lang = lang.clone();
+        let sys_lang = sys_lang.clone();
 
         move || {
             let Some(window) = weak.upgrade() else {
                 return;
             };
+
+            // Пользователь сменил язык в системных настройках, пока мы
+            // работали. В режиме «Авто» интерфейс следует за ним; при явном
+            // выборе обновится только подпись «Авто (…)» в строке настроек.
+            while let Ok(system) = lang_rx.try_recv() {
+                sys_lang.set(system);
+                let choice = LangChoice::from_config(cfg.borrow().language.as_deref());
+                apply_language(&window, &pager, &last_status, &lang, choice, system);
+            }
 
             // scale_factor бэкенд выставляет только после старта своего цикла,
             // поэтому «миллиметр в логических пикселях» пересчитываем здесь.
@@ -548,7 +679,7 @@ fn ui_main(iv: &'static Inkview, evt_rx: Receiver<Event>, redraw_rx: Receiver<()
             pager.set_rows(window.get_rows_per_page().max(1) as usize);
 
             while let Ok(msg) = msg_rx.try_recv() {
-                apply(&window, &pager, msg);
+                apply(&window, &pager, &last_status, lang.get(), msg);
             }
             // Одна перерисовка на всю разобранную пачку: пришедшие разом
             // обложки и статусы книг иначе дали бы по полному сбросу модели
@@ -556,7 +687,9 @@ fn ui_main(iv: &'static Inkview, evt_rx: Receiver<Event>, redraw_rx: Receiver<()
             pager.flush();
 
             while let Ok((field, value)) = answer_rx.try_recv() {
-                apply_answer(&window, &cfg, &cfg_path, &cmd_tx, field, value);
+                if let Some(s) = apply_answer(&window, &cfg, &cfg_path, &cmd_tx, field, value) {
+                    set_status(&window, &last_status, lang.get(), s);
+                }
             }
 
             if redraw_rx.try_iter().count() > 0 {
@@ -570,14 +703,59 @@ fn ui_main(iv: &'static Inkview, evt_rx: Receiver<Event>, redraw_rx: Receiver<()
     window.run().expect("цикл событий завершился с ошибкой");
 }
 
-fn apply(window: &MainWindow, pager: &Rc<Pager>, msg: Msg) {
+fn apply(
+    window: &MainWindow,
+    pager: &Rc<Pager>,
+    last_status: &RefCell<Option<Status>>,
+    lang: Lang,
+    msg: Msg,
+) {
     match msg {
-        Msg::Status(text) => window.set_status(text.into()),
+        Msg::Status(s) => set_status(window, last_status, lang, s),
         Msg::Busy(busy) => window.set_busy(busy),
         Msg::Books(list) => pager.set_books(list),
         Msg::BookState(id, state) => pager.set_state(id as i64, state),
         Msg::Cover { id, cover } => pager.set_cover(id, cover),
     }
+}
+
+/// Показывает статус на текущем языке и запоминает его данными: при смене
+/// языка `apply_language` перерисует его заново.
+fn set_status(window: &MainWindow, last: &RefCell<Option<Status>>, lang: Lang, s: Status) {
+    window.set_status(i18n::status(&s, lang).into());
+    *last.borrow_mut() = Some(s);
+}
+
+/// Переключает язык интерфейса. Общий путь для тапа по строке «Язык» и для
+/// смены языка в системных настройках (в режиме «Авто»).
+fn apply_language(
+    window: &MainWindow,
+    pager: &Rc<Pager>,
+    last_status: &RefCell<Option<Status>>,
+    lang_cell: &Cell<Lang>,
+    choice: LangChoice,
+    system: Lang,
+) {
+    // Подпись строки обновляется всегда: «Авто (English)» → «English» — это
+    // видимое изменение, даже когда действующий язык остался прежним.
+    window.set_cfg_language(i18n::language_row_value(choice, system).into());
+
+    let new = choice.resolve(system);
+    if lang_cell.replace(new) == new {
+        return;
+    }
+
+    // Все @tr-строки Slint перерисовывает сам; вручную перерисовываем то,
+    // что рендерит Rust: список (состояния, заглушки, номер страницы) и
+    // последний статус. Плюс полный кадр — e-ink иначе оставит артефакты.
+    if let Err(e) = slint::select_bundled_translation(new.code()) {
+        eprintln!("select_bundled_translation({}): {e}", new.code());
+    }
+    pager.render();
+    if let Some(s) = &*last_status.borrow() {
+        window.set_status(i18n::status(s, new).into());
+    }
+    window.set_repaint_tick(window.get_repaint_tick() + 1);
 }
 
 /// Показывает текущие настройки на экране настроек.
@@ -607,7 +785,8 @@ fn current_value(cfg: &Config, field: Field) -> String {
 }
 
 /// Принимает то, что набрали на клавиатуре: обновляет настройки, пишет их на
-/// диск и пересобирает клиента в рабочем потоке.
+/// диск и пересобирает клиента в рабочем потоке. Возвращает статус для строки
+/// состояния — показывает его вызывающий, у которого есть текущий язык.
 fn apply_answer(
     window: &MainWindow,
     cfg: &Rc<RefCell<Config>>,
@@ -615,14 +794,12 @@ fn apply_answer(
     cmd_tx: &Sender<Cmd>,
     field: Field,
     value: Option<String>,
-) {
+) -> Option<Status> {
     // Клавиатуру всегда закрывают поверх нашего кадра, даже если ввод отменили,
     // поэтому перерисовываем в любом случае.
     window.set_repaint_tick(window.get_repaint_tick() + 1);
 
-    let Some(value) = value else {
-        return;
-    };
+    let value = value?;
     let value = value.trim().to_string();
     let optional = |v: String| if v.is_empty() { None } else { Some(v) };
 
@@ -661,15 +838,16 @@ fn apply_answer(
     // его только если настройки правда изменились. Иначе достаточно было
     // открыть поле и нажать «ОК», ничего не правя, — и список пропадал.
     if *cfg == before {
-        return;
+        return None;
     }
 
-    match cfg.save(cfg_path) {
-        Ok(()) => window.set_status("Настройки сохранены — нажмите «Обновить»".into()),
-        Err(e) => window.set_status(format!("Не удалось сохранить настройки: {e}").into()),
-    }
+    let status = match cfg.save(cfg_path) {
+        Ok(()) => Status::SettingsSaved,
+        Err(e) => Status::SettingsSaveFailed(e.to_string()),
+    };
 
     let _ = cmd_tx.send(Cmd::Reconfigure(cfg.clone()));
+    Some(status)
 }
 
 fn worker(iv: &'static Inkview, cfg: Config, cmd_rx: Receiver<Cmd>, msg_tx: Sender<Msg>) {
@@ -709,63 +887,66 @@ fn worker(iv: &'static Inkview, cfg: Config, cmd_rx: Receiver<Cmd>, msg_tx: Send
             }
 
             Cmd::Refresh => {
-                let _ = msg_tx.send(Msg::Status("Проверяю сеть…".to_string()));
+                let _ = msg_tx.send(Msg::Status(Status::CheckingNetwork));
 
                 match net::ensure_online(iv) {
                     Ok(()) => {
-                        let _ = msg_tx.send(Msg::Status("Загружаю список книг…".to_string()));
+                        let _ = msg_tx.send(Msg::Status(Status::LoadingList));
                         match client.list() {
                             Ok(list) => {
-                                let _ = msg_tx
-                                    .send(Msg::Status(format!("Книг в списке: {}", list.len())));
+                                let _ = msg_tx.send(Msg::Status(Status::BookCount(list.len())));
                                 known = list.clone();
                                 let _ = msg_tx.send(Msg::Books(list));
                             }
                             Err(e) => {
-                                let _ = msg_tx
-                                    .send(Msg::Status(format!("Не удалось получить список: {e}")));
+                                let _ =
+                                    msg_tx.send(Msg::Status(Status::ListFailed(e.to_string())));
                             }
                         }
                     }
-                    Err(e) => {
-                        let _ = msg_tx.send(Msg::Status(e));
+                    Err(net::ConnectError(code)) => {
+                        let _ = msg_tx.send(Msg::Status(Status::NetworkFailed(code)));
                     }
                 }
             }
 
             Cmd::Download(id) => match known.iter().find(|b| b.id as i32 == id).cloned() {
                 None => {
-                    let _ = msg_tx.send(Msg::Status(
-                        "Книга не найдена, обновите список".to_string(),
-                    ));
+                    let _ = msg_tx.send(Msg::Status(Status::BookNotFound));
                 }
                 Some(book) if book.format.is_none() => {
-                    let _ = msg_tx.send(Msg::BookState(id, "нет формата"));
-                    let _ = msg_tx.send(Msg::Status(format!(
-                        "«{}»: нет ни одного из нужных форматов",
-                        book.title
-                    )));
+                    let _ = msg_tx.send(Msg::BookState(id, i18n::BookState::NoFormat));
+                    let _ = msg_tx.send(Msg::Status(Status::NoFormat {
+                        title: book.title.clone(),
+                    }));
                 }
                 Some(book) => {
-                    let _ = msg_tx.send(Msg::BookState(id, "…"));
-                    let _ = msg_tx.send(Msg::Status(format!("Скачиваю «{}»…", book.title)));
+                    let _ = msg_tx.send(Msg::BookState(id, i18n::BookState::InProgress));
+                    let _ = msg_tx.send(Msg::Status(Status::Downloading {
+                        title: book.title.clone(),
+                    }));
 
-                    let result = net::ensure_online(iv)
-                        .map_err(calibre::Error::from)
-                        .and_then(|()| client.download(&book, &cfg.download_dir));
+                    // Сетевая ошибка и ошибка самой закачки — разные статусы,
+                    // поэтому ветвление явное, а не одна цепочка and_then.
+                    let outcome = match net::ensure_online(iv) {
+                        Err(net::ConnectError(code)) => Err(Status::NetworkFailed(code)),
+                        Ok(()) => client
+                            .download(&book, &cfg.download_dir)
+                            .map_err(|e| Status::DownloadFailed(e.to_string())),
+                    };
 
-                    match result {
+                    match outcome {
                         Ok(path) => {
-                            let _ = msg_tx.send(Msg::BookState(id, "готово"));
+                            let _ = msg_tx.send(Msg::BookState(id, i18n::BookState::Done));
                             let name = path
                                 .file_name()
                                 .map(|n| n.to_string_lossy().into_owned())
                                 .unwrap_or_default();
-                            let _ = msg_tx.send(Msg::Status(format!("Сохранено: {name}")));
+                            let _ = msg_tx.send(Msg::Status(Status::Saved { name }));
                         }
-                        Err(e) => {
-                            let _ = msg_tx.send(Msg::BookState(id, "ошибка"));
-                            let _ = msg_tx.send(Msg::Status(format!("Ошибка загрузки: {e}")));
+                        Err(status) => {
+                            let _ = msg_tx.send(Msg::BookState(id, i18n::BookState::Failed));
+                            let _ = msg_tx.send(Msg::Status(status));
                         }
                     }
                 }
